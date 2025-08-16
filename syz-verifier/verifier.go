@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/syzkaller/pkg/corpus"
 	"github.com/google/syzkaller/pkg/db"
 	"github.com/google/syzkaller/pkg/flatrpc"
@@ -441,6 +443,7 @@ func (vrf *Verifier) fuzzingLoop(ctx context.Context) {
 			var wg sync.WaitGroup
 			wg.Add(len(vrf.sources))
 			distributed := 0
+			responses := make([]*queue.Result, len(vrf.sources))
 			log.Logf(3, "distributing program: %s to %d kernels", req.Prog.String(), len(vrf.sources))
 			for kernelID, source := range vrf.sources {
 				log.Logf(3, "distributing program to kernel %d: %s", kernelID, req.Prog.String())
@@ -458,7 +461,8 @@ func (vrf *Verifier) fuzzingLoop(ctx context.Context) {
 					Avoid:           req.Avoid,
 				}
 				reqCopy.OnDone(func(req *queue.Request, res *queue.Result) bool {
-					log.Logf(3, "got result for kernel:%d %s: %v", kernelID, reqCopy.Prog.String(), res)
+					log.Logf(3, "got result for kernel:%d %s: %+v with info: %+v", kernelID, reqCopy.Prog.String(), res, res.Info)
+					responses[kernelID] = res
 					wg.Done()
 					return true
 				})
@@ -469,7 +473,53 @@ func (vrf *Verifier) fuzzingLoop(ctx context.Context) {
 			wg.Wait()
 			log.Logf(3, "all %d kernels finished execution", len(vrf.sources))
 			log.Logf(3, "comparing results for %d kernels", len(vrf.sources))
-			// TODO: Implement result comparison logic to detect behavioral differences
+			opts := []cmp.Option{
+				cmpopts.IgnoreFields(queue.Result{}, "Executor"),
+				cmpopts.IgnoreFields(flatrpc.ProgInfoRawT{}, "Elapsed"),
+				cmpopts.IgnoreFields(flatrpc.CallInfoRawT{}, "Signal", "Cover", "Comps"),
+				cmp.Transformer("NormalizeFlags", func(call flatrpc.CallInfoRawT) flatrpc.CallInfoRawT {
+					// Keep only behavioral flags (Executed + Finished), filter out noise
+					const behavioralFlags = flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished
+					call.Flags = call.Flags & behavioralFlags
+					return call
+				}),
+			}
+			for i, res := range responses {
+				if !cmp.Equal(responses[0], res, opts...) {
+					log.Logf(0, "=== MISMATCH DETECTED between kernel 0 and kernel %d ===", i)
+					log.Logf(0, "Program: %s", req.Prog.String())
+
+					// Compare each syscall individually
+					for callIdx := 0; callIdx < len(responses[0].Info.Calls) && callIdx < len(res.Info.Calls); callIdx++ {
+						call0 := responses[0].Info.Calls[callIdx]
+						call1 := res.Info.Calls[callIdx]
+
+						// Extract syscall name and format from program
+						syscallName := "unknown"
+						syscallStr := ""
+						if callIdx < len(req.Prog.Calls) {
+							progCall := req.Prog.Calls[callIdx]
+							syscallName = progCall.Meta.Name
+							// Simple formatting - just syscall name and arg count
+							syscallStr = fmt.Sprintf("%s(...%d args)", progCall.Meta.Name, len(progCall.Args))
+						}
+
+						if !cmp.Equal(call0, call1, opts...) {
+							log.Logf(0, "  [DIFF] Call %d (%s):", callIdx, syscallName)
+							log.Logf(0, "    %s", syscallStr)
+							log.Logf(0, "    Kernel 0: Error=%d, Flags=%d", call0.Error, call0.Flags)
+							log.Logf(0, "    Kernel %d: Error=%d, Flags=%d", i, call1.Error, call1.Flags)
+						} else {
+							log.Logf(0, "  [SAME] Call %d (%s): Error=%d, Flags=%d", callIdx, syscallName, call0.Error, call0.Flags)
+							log.Logf(0, "    %s", syscallStr)
+						}
+					}
+					log.Logf(0, "Kernel 0: output: %s", responses[0].Output)
+					log.Logf(0, "Kernel %d: output: %s", i, res.Output)
+					log.Logf(0, "==========================================")
+					// TODO: send to repro
+				}
+			}
 
 		}
 	}
